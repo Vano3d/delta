@@ -12,24 +12,39 @@ import { ReachFootprint, WorkspaceEnvelope } from '../robot/WorkspaceEnvelope';
 import { PathPreview } from '../robot/PathPreview';
 import { PALETTE } from '../helpers';
 import { useApp } from '@/state/store';
+import { vec3 } from '@/core/math/vec3';
 
 const MAX_PRODUCTS = 240;
 const MAX_TRAYS = 40;
 
 export function PickPlaceScene({ scenario }: { scenario: PickPlaceScenario }) {
   const view = useApp((s) => s.view);
-  const base = scenario.robotBase();
+  const base = scenario.robotBase(0); // берем базу первого робота для гентри
   const pickZ = LAYOUT.beltHeight + PRODUCT_SIZE.box.h - base.z;
 
-  const readRobot = (): RobotSnapshot => ({
-    params: scenario.params,
-    base: scenario.robotBase(),
-    theta: scenario.robot.theta,
-    flange: scenario.robot.flange,
-    yaw: scenario.robot.state.yaw,
-    gripper: scenario.robot.gripper,
-    tool: TOOL_LENGTH.suction,
-  });
+  const readRobot = (i: number): RobotSnapshot => {
+    const r = scenario.robots[i];
+    if (!r) {
+      return {
+        params: scenario.params,
+        base: scenario.robotBase(i),
+        theta: [0, 0, 0],
+        flange: vec3(0, 0, 0),
+        yaw: 0,
+        gripper: 0,
+        tool: TOOL_LENGTH.suction,
+      };
+    }
+    return {
+      params: scenario.params,
+      base: scenario.robotBase(i), // <-- Передаем индекс!
+      theta: r.theta,
+      flange: r.flange,
+      yaw: r.state.yaw,
+      gripper: r.gripper,
+      tool: TOOL_LENGTH.suction,
+    };
+  };
 
   return (
     <group>
@@ -55,7 +70,14 @@ export function PickPlaceScene({ scenario }: { scenario: PickPlaceScenario }) {
       <RejectBin />
       <Products scenario={scenario} />
       <Trays scenario={scenario} />
-      <DeltaRobotModel read={readRobot} tool="suction" />
+      
+      {/* Отрисовка двух роботов. Позиции берутся из robotBase(i) в ядре */}
+      {[0, 1].map((i) => (
+        <group key={i} position={[0, 0, 0]}>
+          <DeltaRobotModel read={() => readRobot(i)} tool="suction" />
+        </group>
+      ))}
+
       <group position={[base.x, base.y, base.z]}>
         {view.workspace && <WorkspaceEnvelope params={scenario.params} tool={TOOL_LENGTH.suction} />}
         {view.workspace && (
@@ -65,8 +87,8 @@ export function PickPlaceScene({ scenario }: { scenario: PickPlaceScenario }) {
       {view.path && (
         <PathPreview
           read={() => ({
-            base: scenario.robotBase(),
-            points: scenario.robot.phase === 'idle' ? [] : scenario.robot.preview,
+            base: scenario.robotBase(0),
+            points: scenario.robots[0]?.phase === 'idle' ? [] : (scenario.robots[0]?.preview || []),
           })}
         />
       )}
@@ -87,7 +109,6 @@ const darkMat = new THREE.MeshStandardMaterial({
   flatShading: true,
 });
 
-/** Portal frame carrying the robot above the conveyors. */
 function Gantry({ height }: { height: number }) {
   const posts: [number, number][] = [
     [-0.75, -0.8],
@@ -113,7 +134,6 @@ function Gantry({ height }: { height: number }) {
           <boxGeometry args={[0.08, 1.68, 0.08]} />
         </mesh>
       ))}
-      {/* robot mounting plate */}
       <mesh position={[0, 0, top + 0.02]} material={darkMat} castShadow receiveShadow>
         <boxGeometry args={[1.5, 0.5, 0.03]} />
       </mesh>
@@ -126,7 +146,6 @@ function Gantry({ height }: { height: number }) {
   );
 }
 
-/** Belt conveyor with a scrolling belt texture. */
 function Conveyor({
   y,
   width,
@@ -265,7 +284,8 @@ function Products({ scenario }: { scenario: PickPlaceScenario }) {
       const i = p.kind === 'box' ? nb++ : nc++;
       if (i >= MAX_PRODUCTS) continue;
       tmpObj.position.set(p.pos.x, p.pos.y, p.pos.z + PRODUCT_SIZE[p.kind].h / 2);
-      tmpObj.rotation.set(p.kind === 'box' ? 0 : Math.PI / 2, 0, p.yaw);
+      // ВАЖНО: для сарделек (цилиндров) поворачиваем их поперек ленты (лежа)
+      tmpObj.rotation.set(0, 0, p.kind === 'box' ? 0 : Math.PI / 2);
       tmpObj.scale.setScalar(1);
       tmpObj.updateMatrix();
       mesh.setMatrixAt(i, tmpObj.matrix);
@@ -323,7 +343,6 @@ function trayGeometry(): THREE.BufferGeometry {
     b.translate((s * (size - 0.008)) / 2, 0, height / 2);
     parts.push(a, b);
   }
-  // slot dividers
   const div1 = new THREE.BoxGeometry(size, 0.005, height * 0.6);
   div1.translate(0, 0, height * 0.3);
   const div2 = new THREE.BoxGeometry(0.005, size, height * 0.6);
@@ -332,7 +351,6 @@ function trayGeometry(): THREE.BufferGeometry {
   return mergeGeometries(parts);
 }
 
-/** Tiny merge helper (all parts are non-indexed after toNonIndexed) to avoid importing examples. */
 function mergeGeometries(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
   const flat = parts.map((p) => p.toNonIndexed());
   const count = flat.reduce((n, g) => n + g.getAttribute('position').count, 0);
@@ -364,7 +382,7 @@ function Trays({ scenario }: { scenario: PickPlaceScenario }) {
       tmpObj.updateMatrix();
       m.setMatrixAt(n, tmpObj.matrix);
       const full = t.slots.every((s) => s !== null);
-      m.setColorAt(n, tmpColor.set(full ? '#1e6f5c' : '#3b4a5a'));
+      m.setColorAt(n, tmpColor.set(full ? '#ff0000' : '#ffff00')); // Твои новые цвета!
       n++;
     }
     m.count = n;

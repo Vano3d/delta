@@ -12,19 +12,15 @@ export type ProductMix = 'boxes' | 'mixed';
 export interface PickPlaceConfig {
   seed: number;
   strategy: Strategy;
-  /** Product conveyor speed [m/s] */
   conveyorSpeed: number;
-  /** Average product arrivals per second */
   spawnRate: number;
   placeMode: PlaceMode;
   trayFlow: TrayFlow;
-  /** Tray conveyor speed [m/s] */
   traySpeed: number;
-  /** Match the tray belt speed to the product rate so trays leave full */
   traySync: boolean;
   mix: ProductMix;
-  /** Rotate products to a common orientation in the tray */
   alignProducts: boolean;
+  spacing: number;
 }
 
 export const DEFAULT_PICK_PLACE: PickPlaceConfig = {
@@ -38,9 +34,9 @@ export const DEFAULT_PICK_PLACE: PickPlaceConfig = {
   traySync: true,
   mix: 'mixed',
   alignProducts: true,
+  spacing: 1.5,
 };
 
-/** Scene layout in world coordinates (Z up, metres). */
 export const LAYOUT = {
   beltHeight: 0.8,
   baseHeight: 1.8,
@@ -48,21 +44,19 @@ export const LAYOUT = {
   trayBelt: { y: 0.3, width: 0.38, xStart: -2.4, xEnd: 2.4 },
   tray: { size: 0.3, height: 0.04, pitch: 0.42, slots: 2 },
   staticTrays: [vec3(-0.25, 0.32, 0), vec3(0.15, 0.32, 0)],
-  /** Items further downstream than this (relative to the robot) count as missed */
   missX: 0.9,
 } as const;
 
 export type ProductKind = 'box' | 'cylinder';
 export const PRODUCT_SIZE: Record<ProductKind, { x: number; y: number; h: number }> = {
   box: { x: 0.12, y: 0.08, h: 0.05 },
-  cylinder: { x: 0.08, y: 0.08, h: 0.06 },
+  cylinder: { x: 0.04, y: 0.04, h: 0.12 },
 };
 
 export interface Product {
   id: number;
   kind: ProductKind;
   color: number;
-  /** World position of the bottom centre */
   pos: Vec3;
   yaw: number;
   state: 'belt' | 'reserved' | 'carried' | 'placed' | 'missed';
@@ -71,7 +65,6 @@ export interface Product {
 
 export interface Tray {
   id: number;
-  /** World position of the tray centre (bottom) */
   pos: Vec3;
   slots: (number | null)[];
   static: boolean;
@@ -83,7 +76,9 @@ export const TOOL_LENGTH = { suction: 0.1, fingers: 0.12 };
 export class PickPlaceScenario implements Scenario, TaskProvider {
   readonly id = 'pickPlace' as const;
   readonly params: DeltaParams = PRESETS.picker;
-  readonly robot: RobotController;
+  
+  readonly robots: RobotController[] = [];
+  
   readonly products: Product[] = [];
   readonly trays: Tray[] = [];
   time = 0;
@@ -97,50 +92,56 @@ export class PickPlaceScenario implements Scenario, TaskProvider {
   private missed = 0;
   private traysDone = 0;
   private traysIncomplete = 0;
-  /** Distance the conveyors moved, for animating the belt texture */
+  private waitingForScroll = false;
   beltTravel = 0;
   trayTravel = 0;
 
   constructor(public config: PickPlaceConfig = DEFAULT_PICK_PLACE) {
     this.rng = new Rng(config.seed);
-    const pickZ = -(LAYOUT.baseHeight - LAYOUT.beltHeight) + PRODUCT_SIZE.box.h;
-    this.robot = new RobotController(
-      {
-        params: this.params,
-        tool: TOOL_LENGTH.suction,
-        arch: {
-          travelZ: pickZ + 0.07,
-          minLift: 0.04,
-          // about 6 g peak acceleration, typical for light delta pickers
-          xy: { vMax: 5, aMax: 60, jMax: 3000 },
-          z: { vMax: 3, aMax: 60, jMax: 3000 },
-          overlap: 0.7,
+    
+    const makeRobot = () => {
+      const pickZ = -(LAYOUT.baseHeight - LAYOUT.beltHeight) + PRODUCT_SIZE.box.h;
+      const r = new RobotController( // <-- Исправлена синтаксическая ошибка
+        {
+          params: this.params,
+          tool: TOOL_LENGTH.suction,
+          arch: {
+            travelZ: pickZ + 0.07,
+            minLift: 0.04,
+            xy: { vMax: 5, aMax: 60, jMax: 3000 },
+            z: { vMax: 3, aMax: 60, jMax: 3000 },
+            overlap: 0.7,
+          },
+          strategy: config.strategy,
+          graspTime: 0.08,
+          releaseTime: 0.06,
+          home: vec3(0, 0.05, pickZ + 0.1),
+          margin: 0.05,
+          maxInterceptTime: 3,
         },
-        strategy: config.strategy,
-        graspTime: 0.08,
-        releaseTime: 0.06,
-        home: vec3(0, 0.05, pickZ + 0.1),
-        margin: 0.05,
-        maxInterceptTime: 3,
-      },
-      this,
-    );
+        this,
+      );
+      r.id = this.robots.length; // 0 или 1
+      return r;
+    };
+    
+    this.robots.push(makeRobot());
+    this.robots.push(makeRobot());
+    
     this.setupTrays();
-    // pre-fill the belt so the demo starts busy
     for (let t = 0; t < 6; t += 1 / 30) this.advanceWorld(1 / 30, false);
   }
 
-  /** Update settings that can change while running. */
   configure(patch: Partial<PickPlaceConfig>) {
     this.config = { ...this.config, ...patch };
-    this.robot.config.strategy = this.config.strategy;
+    for (const r of this.robots) r.config.strategy = this.config.strategy;
   }
 
-  robotBase(): Vec3 {
-    return vec3(0, 0, LAYOUT.baseHeight);
+  robotBase(index: number = 0): Vec3 {
+    const offsetX = index === 0 ? -0.8 : 0.8; 
+    return vec3(offsetX, 0, LAYOUT.baseHeight);
   }
 
-  /** Effective tray belt speed [m/s] */
   get traySpeed(): number {
     if (!this.config.traySync) return this.config.traySpeed;
     const slots = LAYOUT.tray.slots ** 2;
@@ -163,30 +164,29 @@ export class PickPlaceScenario implements Scenario, TaskProvider {
         this.trays.push(this.newTray(vec3(p.x, p.y, LAYOUT.beltHeight), true));
       return;
     }
-    const { xStart, xEnd, y } = LAYOUT.trayBelt;
-    for (let x = xStart + 0.2; x < xEnd; x += LAYOUT.tray.pitch)
-      this.trays.push(this.newTray(vec3(x, y, LAYOUT.beltHeight), false));
+    // Создаем 4 лотка (2 ряда по 2) в зоне роботов
+    const { y } = LAYOUT.trayBelt;
+    const startX = -0.4;
+    for (let i = 0; i < 2; i++) {
+      for (let j = 0; j < 2; j++) {
+        const x = startX + i * LAYOUT.tray.pitch;
+        const yy = y + (j - 0.5) * LAYOUT.tray.pitch;
+        this.trays.push(this.newTray(vec3(x, yy, LAYOUT.beltHeight), true));
+      }
+    }
   }
 
-  // ---- world simulation ---------------------------------------------------------------------
-
   private spawnProduct() {
-    const kind: ProductKind = this.config.mix === 'boxes' || this.rng.next() < 0.6 ? 'box' : 'cylinder';
-    const halfSpan = LAYOUT.belt.width / 2 - 0.07;
-    const y = LAYOUT.belt.y + this.rng.range(-halfSpan, halfSpan);
+    const kind: ProductKind = 'cylinder'; // Пока только сардельки
+    const y = LAYOUT.belt.y;
     const pos = vec3(LAYOUT.belt.xStart, y, LAYOUT.beltHeight);
-    // avoid overlapping with the previous products at the belt entry
-    const blocked = this.products.some(
-      (p) => p.state === 'belt' && Math.hypot(p.pos.x - pos.x, p.pos.y - pos.y) < 0.15,
-    );
-    if (blocked) return false;
-    const palette = [0xf97316, 0x38bdf8, 0xa3e635, 0xf43f5e, 0xfacc15];
+    
     this.products.push({
       id: this.nextId++,
       kind,
-      color: this.rng.pick(palette),
+      color: 0xf97316,
       pos,
-      yaw: this.rng.range(-Math.PI, Math.PI),
+      yaw: 0,
       state: 'belt',
     });
     return true;
@@ -194,14 +194,14 @@ export class PickPlaceScenario implements Scenario, TaskProvider {
 
   private advanceWorld(dt: number, withRobot: boolean) {
     const v = this.config.conveyorSpeed;
-    const tv = this.trayVelocity;
     this.beltTravel += v * dt;
-    this.trayTravel += tv * dt;
 
+    // Спавн паровозиком
+    const timeToTravelSpacing = this.config.spacing / v;
     this.nextSpawn -= dt;
     if (this.nextSpawn <= 0) {
-      if (this.spawnProduct()) this.nextSpawn = this.rng.exponential(this.config.spawnRate);
-      else this.nextSpawn = 0.05;
+      this.spawnProduct();
+      this.nextSpawn = timeToTravelSpacing;
     }
 
     for (const p of this.products) {
@@ -213,19 +213,13 @@ export class PickPlaceScenario implements Scenario, TaskProvider {
       }
     }
 
-    for (const tray of this.trays) {
-      if (tray.static) continue;
-      tray.pos = vec3(tray.pos.x + tv * dt, tray.pos.y, tray.pos.z);
-    }
-    // products in trays move with them
+    // Лотки стоят на месте
     for (const p of this.products) {
       if (p.state !== 'placed') continue;
       const tray = this.trays.find((t) => t.id === p.trayId);
-      if (tray && !tray.static) p.pos = vec3(p.pos.x + tv * dt, p.pos.y, p.pos.z);
+      if (tray && !tray.static) p.pos = vec3(p.pos.x, p.pos.y, p.pos.z);
     }
 
-    this.recycleTrays(withRobot);
-    // remove products that fell off the end of the belt
     for (let i = this.products.length - 1; i >= 0; i--) {
       const p = this.products[i]!;
       if ((p.state === 'belt' || p.state === 'missed') && p.pos.x > LAYOUT.belt.xEnd) {
@@ -235,55 +229,46 @@ export class PickPlaceScenario implements Scenario, TaskProvider {
     }
   }
 
-  private recycleTrays(count: boolean) {
-    const { xStart, xEnd } = LAYOUT.trayBelt;
-    for (let i = this.trays.length - 1; i >= 0; i--) {
-      const tray = this.trays[i]!;
-      const full = tray.slots.every((s) => s !== null);
-      // an operator swaps full static trays instantly, moving trays leave at the belt end
-      const leave = tray.static ? full : tray.pos.x > xEnd + 0.2 || tray.pos.x < xStart - 0.2;
-      if (!leave) continue;
-      if (count) {
-        if (full) this.traysDone++;
-        else if (tray.slots.some((s) => s !== null)) this.traysIncomplete++;
-      }
-      for (let k = this.products.length - 1; k >= 0; k--)
-        if (this.products[k]!.trayId === tray.id) this.products.splice(k, 1);
-      this.trays.splice(i, 1);
-      if (tray.static) this.trays.push(this.newTray(tray.pos, true));
-    }
-    if (this.config.placeMode === 'trayConveyor') {
-      // keep the tray belt filled at a fixed pitch
-      const tv = this.trayVelocity;
-      const upstream = tv >= 0 ? xStart : xEnd;
-      const nearest = this.trays.reduce((m, t) => Math.min(m, Math.abs(t.pos.x - upstream)), Infinity);
-      if (nearest >= LAYOUT.tray.pitch) {
-        const x = tv >= 0 ? upstream + nearest - LAYOUT.tray.pitch : upstream - nearest + LAYOUT.tray.pitch;
-        this.trays.push(this.newTray(vec3(x, LAYOUT.trayBelt.y, LAYOUT.beltHeight), false));
-      }
-    }
-  }
-
   step(dt: number) {
     this.time += dt;
     this.advanceWorld(dt, true);
-    this.robot.step(this.time, dt);
-    // carried products follow the gripper
-    const carried = this.robot.carrying;
-    if (carried) {
-      const p = this.products.find((q) => q.id === carried.id);
-      if (p) {
-        const eff = add(this.robotBase(), this.robot.state.p);
-        p.pos = vec3(eff.x, eff.y, eff.z - PRODUCT_SIZE[p.kind].h);
-        p.yaw = this.robot.state.yaw - this.robot.carryYawOffset;
+    
+    this.robots.forEach((r, i) => {
+      r.base = this.robotBase(i);
+      r.step(this.time, dt);
+    });
+    
+    this.robots.forEach((r) => {
+      const carried = r.carrying;
+      if (carried) {
+        const p = this.products.find((q) => q.id === carried.id);
+        if (p) {
+          const eff = add(r.base, r.state.p);
+          p.pos = vec3(eff.x, eff.y, eff.z - PRODUCT_SIZE[p.kind].h);
+          p.yaw = r.state.yaw - r.carryYawOffset;
+        }
+      }
+    });
+
+    // Логика термоформера: если все 4 лотка заполнены, прокручиваем
+    if (!this.waitingForScroll) {
+      const allFull = this.trays.every(t => t.slots.every(s => s !== null));
+      if (allFull && this.trays.length > 0) {
+        this.waitingForScroll = true;
+        setTimeout(() => {
+          for (const tray of this.trays) {
+            tray.pos = vec3(tray.pos.x + LAYOUT.tray.pitch * 2, tray.pos.y, tray.pos.z);
+            tray.slots.fill(null);
+          }
+          this.waitingForScroll = false;
+          this.traysDone++;
+        }, 1000);
       }
     }
   }
 
-  // ---- task provider ------------------------------------------------------------------------
-
   private toRobot(world: Vec3): Vec3 {
-    return sub(world, this.robotBase());
+    return sub(world, this.robotBase(0));
   }
 
   private productTarget(p: Product): Target {
@@ -296,7 +281,6 @@ export class PickPlaceScenario implements Scenario, TaskProvider {
     };
   }
 
-  /** Slot centre in world coordinates. */
   slotPosition(tray: Tray, k: number): Vec3 {
     const n = LAYOUT.tray.slots;
     const pitch = LAYOUT.tray.size / n;
@@ -314,35 +298,35 @@ export class PickPlaceScenario implements Scenario, TaskProvider {
     return {
       id: SLOT_ID_BASE + tray.id * 16 + k,
       pos: this.toRobot(vec3(s.x, s.y, s.z + itemHeight + 0.005)),
-      vel: vec3(tray.static ? 0 : this.trayVelocity, 0, 0),
+      vel: vec3(0, 0, 0),
       yaw: this.config.alignProducts ? 0 : Number.NaN,
       symmetry: Math.PI,
     };
   }
 
-  pickCandidates(): Target[] {
-    return this.products.filter((p) => p.state === 'belt').map((p) => this.productTarget(p));
+  pickCandidates(robotId: number = 0): Target[] {
+    const all = this.products.filter((p) => p.state === 'belt').map((p) => this.productTarget(p));
+    
+    return all.filter(t => {
+      if (robotId === 0) {
+        return t.pos.x < 0.4;
+      } else {
+        return t.pos.x >= -0.4;
+      }
+    });
   }
 
   placeCandidates(item: Target): Target[] {
     const product = this.products.find((p) => p.id === item.id);
     const h = product ? PRODUCT_SIZE[product.kind].h : 0.05;
-    const tv = this.trayVelocity;
-    // fill the most downstream tray first so trays leave full
-    const trays = [...this.trays].sort((a, b) => (tv >= 0 ? b.pos.x - a.pos.x : a.pos.x - b.pos.x));
     const out: Target[] = [];
-    for (const tray of trays) {
-      // skip trays that have already passed the robot
-      if (tv > 0 && tray.pos.x > LAYOUT.missX) continue;
-      if (tv < 0 && tray.pos.x < -LAYOUT.missX) continue;
+    for (const tray of this.trays) {
       tray.slots.forEach((s, k) => {
         if (s === null) {
           const t = this.slotTarget(tray, k, h);
-          // keep the product orientation if alignment is off
           out.push(Number.isNaN(t.yaw) ? { ...t, yaw: item.yaw } : t);
         }
       });
-      if (out.length >= 8) break;
     }
     return out;
   }
@@ -353,8 +337,9 @@ export class PickPlaceScenario implements Scenario, TaskProvider {
       const k = (id - SLOT_ID_BASE) % 16;
       const tray = this.trays.find((t) => t.id === trayId);
       if (!tray) return undefined;
-      const carried = this.robot.carrying && this.products.find((p) => p.id === this.robot.carrying!.id);
-      const t = this.slotTarget(tray, k, carried ? PRODUCT_SIZE[carried.kind].h : 0.05);
+      const carried = this.robots.find(r => r.carrying)?.carrying;
+      const product = carried ? this.products.find(p => p.id === carried.id) : undefined;
+      const t = this.slotTarget(tray, k, product ? PRODUCT_SIZE[product.kind].h : 0.05);
       return t;
     }
     const p = this.products.find((q) => q.id === id);
@@ -390,7 +375,6 @@ export class PickPlaceScenario implements Scenario, TaskProvider {
     const p = this.products.find((q) => q.id === item.id);
     if (!p) return;
     if (p.state === 'carried') {
-      // dropped: count as missed
       p.state = 'missed';
       this.missed++;
     } else if (p.state === 'reserved') p.state = 'belt';
@@ -400,10 +384,8 @@ export class PickPlaceScenario implements Scenario, TaskProvider {
     return 0.3;
   }
 
-  // ---- metrics ------------------------------------------------------------------------------
-
   metrics(): Metric[] {
-    const s = this.robot.stats;
+    const s = this.robots[0]?.stats || { cycleTimes: [], busyTime: 0, totalTime: 1 };
     const minutes = Math.max(this.time, 1) / 60;
     const avgCycle = s.cycleTimes.length ? s.cycleTimes.reduce((a, b) => a + b, 0) / s.cycleTimes.length : 0;
     const total = this.placed + this.missed;
@@ -421,13 +403,9 @@ export class PickPlaceScenario implements Scenario, TaskProvider {
       { label: 'Avg cycle', value: avgCycle, unit: 's', digits: 2 },
       { label: 'Utilisation', value: (100 * s.busyTime) / Math.max(s.totalTime, 1e-9), unit: '%', digits: 0 },
       { label: 'Trays filled', value: this.traysDone },
-      ...(this.traysIncomplete
-        ? [{ label: 'Trays incomplete', value: this.traysIncomplete, tone: 'bad' as const }]
-        : []),
     ];
   }
 
-  /** Raw counters for tests and the benchmark. */
   counters() {
     return { placed: this.placed, missed: this.missed, time: this.time };
   }

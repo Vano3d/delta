@@ -33,7 +33,7 @@ export function StatsHud() {
           </div>
         ))}
       </div>
-      <PhaseBar phase={s.robot.phase} />
+      <PhaseBar phase={s.robots[0]?.phase || 'idle'} />
     </div>
   );
 }

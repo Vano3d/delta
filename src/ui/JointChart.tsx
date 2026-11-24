@@ -78,7 +78,7 @@ export function JointChart() {
       last = now;
       const s = sim.scenario;
       if (!s) return;
-      const { t, series } = s.robot.telemetry.snapshot(cfg.channels);
+const { t, series } = s.robots[0]?.telemetry.snapshot(cfg.channels) || { t: [], series: [[], [], []] };
       const t1 = t[t.length - 1] ?? 0;
       const from = t.findIndex((x) => x >= t1 - WINDOW);
       const start = Math.max(0, from);

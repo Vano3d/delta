@@ -24,7 +24,7 @@ import { Telemetry } from './telemetry';
 /** What a scenario must provide so the controller can work on it. */
 export interface TaskProvider {
   /** Items that may be picked (not yet reserved) */
-  pickCandidates(): Target[];
+  pickCandidates(robotId?: number): Target[];
   /** Places the given item can go to (e.g. free tray slots, the weed bin) */
   placeCandidates(item: Target): Target[];
   /** Look up a target by id; undefined if it disappeared */
@@ -77,6 +77,7 @@ export interface ControllerStats {
  * intercepts it, tracks it while the gripper closes, carries it to a place target and releases it.
  */
 export class RobotController {
+  public id: number = 0; // <-- Добавлено
   phase: Phase = 'idle';
   state: MotionState;
   theta: Joints = [0, 0, 0];
@@ -149,7 +150,8 @@ export class RobotController {
     const ctx = this.ctx;
     const start = { p: this.state.p, v: this.state.v, yaw: this.state.yaw };
     const cands: Candidate[] = [];
-    for (const target of this.tasks.pickCandidates()) {
+    // Передаем ID робота в метод
+    for (const target of this.tasks.pickCandidates(this.id)) {
       const window = reachWindow(ctx, target);
       if (window && window[1] > ctx.graspTime) cands.push({ target, window });
     }

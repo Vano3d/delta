@@ -14,7 +14,7 @@ export function Section({
   return (
     <section className="space-y-3 border-t border-line px-4 py-4 first:border-t-0">
       <div className="flex items-center justify-between">
-        <h3 className="text-[11px] font-semibold tracking-[0.14em] text-slate-400 uppercase">{title}</h3>
+        <h3 className="text-[11px] font-semibold tracking-[0.14em] text-red-600 uppercase">{title}</h3>
         {right}
       </div>
       {children}
